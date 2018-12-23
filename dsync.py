@@ -189,7 +189,7 @@ def run_client(root, ip_address):
             print(err)
 
 def run_server(root):
-    with SimpleXMLRPCServer(('localhost', PORT), logRequests=False, allow_none=True) as server:
+    with SimpleXMLRPCServer(('', PORT), logRequests=False, allow_none=True) as server:
         try:
             os.chdir(root)
             server.register_multicall_functions()
