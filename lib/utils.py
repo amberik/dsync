@@ -1,11 +1,14 @@
 import os, hashlib, zlib, shutil, math
 from threading import Thread
+from collections import namedtuple
 from queue import Queue
 from collections import defaultdict
+from uuid import uuid4
 from functools import partial
-from xmlrpc.client import Binary
+from xmlrpc.client import Binary, MultiCall
 
 rdict = lambda: defaultdict(rdict)
+Id    = lambda x: x
 
 DEFAULT_BLOCK_SIZE = 65536
 
@@ -15,6 +18,69 @@ def debug(func):
         if DEBUG:
             return func(*a, **kw)
     return wrapper
+
+
+class ThreadPoolStop(BaseException):
+    pass
+
+class ThreadPool(object):
+    def __init__(self, num_workers=1):
+        self.q = Queue()
+        def loop():
+            try:
+                while True:
+                    func, a, kw, call_back = self.q.get()
+                    try:
+                        call_back(func(*a, **kw))
+                    except Exception as err:
+                        call_back(err)
+            except ThreadPoolStop:
+                pass
+
+        self.threads = [Thread(target=loop) for _ in range(num_workers)]
+        for tread in self.threads:
+            tread.daemon = True
+
+    def start(self):
+        for tread in self.threads:
+            tread.start()
+
+    def stop(self):
+        def stop_thread():
+            raise ThreadPoolStop
+        for _ in self.threads:
+            self.q.put((stop_thread, (), {}, None))
+        for tread in self.threads:
+            tread.join()
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.stop()
+
+    def run_task(self, func, *a, **kw):
+        def get_task_result(q, no_wait=False):
+            TaskResult = namedtuple('TaskResult', ['status', 'result'])
+            res = None
+            if no_wait:
+                try:
+                    res = q.get_nowait()
+                except Empty:
+                    return TaskResult(result=None, status=False)
+            else:
+                res = q.get()
+            if isinstance(res, Exception):
+                raise res
+            res = TaskResult(result=res, status=True)
+            q.task_done()
+            return res
+
+        q = Queue()
+        self.q.put((func, a, kw, q.put))
+        return partial(get_task_result, q)
+
 
 def asinc_call(func):
     def worker():
@@ -103,16 +169,17 @@ def write_block(path, offset, block):
     with open(path, 'r+b') as f:
         f.seek(offset)
         f.write(block)
+    return len(block)
 
 def read_block_compr(path, offset, size):
     return zlib.compress(read_block(path, offset, size))
 
 def write_block_compr(path, offset, block):
-    write_block(path, offset, zlib.decompress(block))
+    return write_block(path, offset, zlib.decompress(block))
 
 def copy_block(s_path, s_offset, d_path, d_offset, size):
     block = read_block(s_path, s_offset, size)
-    write_block(d_path, d_offset, block)
+    return write_block(d_path, d_offset, block)
 
 # This class is used by RPC ServerProxy
 # to do FS operations on the server side
@@ -161,22 +228,93 @@ class ServerProvider(object):
     def write_block_compr(self, path, offset, block):
         if isinstance(block, Binary):
             block = block.data
-        write_block_compr(path, offset, block)
+        return write_block_compr(path, offset, block)
 
     def write_blocks_compr(self, files, block):
+        size = 0
         if isinstance(block, Binary):
             block = block.data
         for path, block_info in files.items():
-            write_block_compr(path, block_info['offset'], block)
+            size += write_block_compr(path, block_info['offset'], block)
+        return size
 
     def write_blocks(self, files, block):
+        size = 0
         if isinstance(block, Binary):
             block = block.data
         for path, block_info in files.items():
-            write_block(path, block_info['offset'], block)
+            size += write_block(path, block_info['offset'], block)
+        return size
 
     def copy_block(self, s_path, s_offset, d_path, d_offset, size):
-        copy_block(s_path, s_offset, d_path, d_offset, size)
+        return copy_block(s_path, s_offset, d_path, d_offset, size)
 
-    def ping(self):
-        pass
+    def ping(self): ...
+
+
+class ParallelCall(object):
+    def __init__(self, proxy):
+        self.proxy = proxy
+        self.tasks = []
+
+    def __len__(self):
+        return len(self.tasks)
+
+    def __getattr__(self, name):
+        def call_async_decor(func):
+            def call_async(*a, **kw):
+                self.tasks.append(func(*a, **kw))
+            return call_async
+        name = name + '_async'
+        return call_async_decor(getattr(self.proxy, name))
+
+    def __iter__(self):
+        tasks = self.tasks
+        self.tasks = []
+        get_task_result = self.proxy.get_task_result
+        return map(get_task_result, tasks)
+
+    def __call__(self):
+        tasks = self.tasks
+        self.tasks = []
+        mcall = MultiCall(self.proxy)
+        list(map(mcall.get_task_result, tasks))
+        return mcall()
+
+# TODO Call this class with appropriate name
+class Parallel(object):
+
+    def __init__(self, inst, num_workers=10):
+        self.workers = ThreadPool(num_workers)
+        self.tasks   = {}
+        self.inst    = inst
+
+    def start(self):
+        self.workers.start()
+
+    def stop(self):
+        self.workers.stop()
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.stop()
+
+    def get_task_result(self, task_id):
+        task = self.tasks.pop(task_id)
+        return task().result
+
+    def __getattr__(self, name):
+        func_decorator = Id
+        def call_async_decor(func):
+            def call_async(*a, **kw):
+                task_id = str(uuid4())
+                self.tasks[task_id] = self.workers.run_task(func, *a, **kw)
+                return task_id
+            return call_async
+        if name.endswith('_async'):
+            name = name[:-6]
+            func_decorator = call_async_decor
+        return func_decorator(self.inst.__getattribute__(name))

@@ -4,9 +4,9 @@ from itertools import takewhile
 from xmlrpc.server import SimpleXMLRPCServer
 from xmlrpc.client import ServerProxy, MultiCall, Fault, Binary, Marshaller
 from lib.fs_info import FsInfoMetaData
-from lib.utils import (join, rdict, ServerProvider, read_block_compr, read_block, fs_tree,
+from lib.utils import (join, rdict, ServerProvider, Parallel, ParallelCall, read_block_compr, read_block, fs_tree,
                        convert_size, ui_message, percent_gen, roller, debug, asinc_call,
-                       DEFAULT_BLOCK_SIZE, get_blocks_info)
+                       DEFAULT_BLOCK_SIZE, get_blocks_info, ThreadPool)
 
 from lib.fs_monitor import (FSMonitor, InitialDiscoveryEvent, is_create_dir, is_create_file,
                             is_del_dir, is_del_file, is_mv_file, is_mv_dir, is_mod_file)
@@ -64,22 +64,33 @@ class DSynch(FsInfoMetaData):
 
     # Copies data to remote host, during initial synch.
     def _copy_data(self, remote_fs_meta_data):
+        hashs_to_copy =  [hash for hash in self.hash_tbl if hash not in remote_fs_meta_data.hash_tbl]
+        self._copy_data_by_hash(hashs_to_copy)
+
+    def _copy_data_by_hash(self, hashs_to_copy):
+        commited_size  = 0
         sent_data_size = 0
         sent_compr_data_size = 0
-        hashs_to_copy =  [hash for hash in self.hash_tbl if hash not in remote_fs_meta_data.hash_tbl]
-
-        pc = percent_gen(len(hashs_to_copy))
+        tasks = ParallelCall(self.peer)
+        pc = percent_gen(len(hashs_to_copy)*2)
         for hash in hashs_to_copy:
             files = self.hash_tbl[hash]
             path, block = next(iter(files.items()))
             compr_block = read_block_compr(path, **block)
-            self.peer.write_blocks_compr(files, compr_block)
+            tasks.write_blocks_compr(files, compr_block)
             sent_data_size       += block['size']*len(files)
             sent_compr_data_size += len(compr_block)
-            ui_message("Initial Synch: Copy files data. "
-                       "Copied: {} sent: {} {}%".format(convert_size(sent_data_size),
-                                                                  convert_size(sent_compr_data_size),
-                                                                  next(pc)))
+            ui_message("Initial Synch: Sending files data. "
+                       "Not compressed: {} compressed: {} {}%".format(convert_size(sent_data_size),
+                                                                convert_size(sent_compr_data_size),
+                                                                next(pc)))
+        for result in tasks():
+            commited_size += result
+            ui_message("Initial Synch: Commiting files data. "
+                       "Commited: {}/{}     {}%".format(convert_size(commited_size),
+                                                        convert_size(sent_data_size),
+                                                        next(pc)))
+
 
     # Updates local FsInfoMetaData according to
     # events for file system.
@@ -161,7 +172,7 @@ class DSynch(FsInfoMetaData):
         self.peer.ping()
         with self.monitor:
             self.do_initial_synch()
-            self.do_delta_synch()
+            #self.do_delta_synch()
 
     def do_initial_synch(self):
         req = asinc_call(lambda: self.peer.fs_tree('.'))
@@ -192,9 +203,10 @@ def run_server(root):
     with SimpleXMLRPCServer(('', PORT), logRequests=False, allow_none=True) as server:
         try:
             os.chdir(root)
-            server.register_multicall_functions()
-            server.register_instance(ServerProvider())
-            server.serve_forever()
+            with Parallel(ServerProvider(), 10) as server_provider:
+                server.register_multicall_functions()
+                server.register_instance(server_provider)
+                server.serve_forever()
         except Exception as err:
             print(err)
 
